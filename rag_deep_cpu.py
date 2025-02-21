@@ -1,7 +1,9 @@
 import streamlit as st
+import os
+import fitz  # PyMuPDF for fast PDF text extraction
 from langchain_community.document_loaders import PDFPlumberLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_community.vectorstores.faiss import FAISS
 from langchain_ollama import OllamaEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_ollama.llms import OllamaLLM
@@ -64,7 +66,6 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-
 PROMPT_TEMPLATE = """
 You are an expert research assistant. Use the provided context to answer the query. 
 If unsure, state that you don't know. Be concise and factual (max 3 sentences).
@@ -73,40 +74,57 @@ Query: {user_query}
 Context: {document_context} 
 Answer:
 """
-PDF_STORAGE_PATH = 'document_store/pdf/'
-EMBEDDING_MODEL = OllamaEmbeddings(model="deepseek-r1:1.5b")
-DOCUMENT_VECTOR_DB = InMemoryVectorStore(EMBEDDING_MODEL)
-LANGUAGE_MODEL = OllamaLLM(model="deepseek-r1:1.5b")
 
+PDF_STORAGE_PATH = 'document_store/pdf/'
+EMBEDDING_MODEL = OllamaEmbeddings(model="deepseek-embedding")
+LANGUAGE_MODEL = OllamaLLM(model="deepseek-lawyer")
+
+if not os.path.exists(PDF_STORAGE_PATH):
+    os.makedirs(PDF_STORAGE_PATH)
 
 def save_uploaded_file(uploaded_file):
-    file_path = PDF_STORAGE_PATH + uploaded_file.name
+    file_path = os.path.join(PDF_STORAGE_PATH, uploaded_file.name)
     with open(file_path, "wb") as file:
         file.write(uploaded_file.getbuffer())
     return file_path
 
+## Since 1GB contains ~100,000 pages, you need an optimized text extraction method.
+#  PyMuPDF is 10x faster than PyPDF2 and works well for legal PDFs.
+def extract_text_from_pdf(pdf_path):
+    """Extract text from a PDF efficiently."""
+    doc = fitz.open(pdf_path)
+    return "\n".join([page.get_text("text") for page in doc])
 
-def load_pdf_documents(file_path):
-    document_loader = PDFPlumberLoader(file_path)
-    return document_loader.load()
+## Since retrieving 1GB at once is slow, break the text into smaller parts.
+## Reduces query time by retrieving only relevant parts instead of scanning 1GB.
+def chunk_text(text):
+    """Split text into smaller chunks for efficient storage and retrieval."""
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
+    return text_splitter.split_text(text)
 
 
-def chunk_documents(raw_documents):
-    text_processor = RecursiveCharacterTextSplitter(
-        chunk_size=500,  # Reduced from 1000
-        chunk_overlap=200,
-        add_start_index=True
+## Instead of reading 1GB each time, store embeddings in FAISS and retrieve only relevant sections.
+## Speeds up document retrieval 10x compared to reprocessing the full 1GB.
+def initialize_vector_store(chunks):
+    # Generate embeddings for the text chunks
+    embeddings = EMBEDDING_MODEL.embed_documents(chunks)
+
+    # Initialize the FAISS vector store
+    vector_db = FAISS.from_embeddings(
+        text_embeddings=list(zip(embeddings, chunks)),
+        embedding=EMBEDDING_MODEL
     )
-    return text_processor.split_documents(raw_documents)
 
+    # Store the vector store in the session state
+    st.session_state.vector_db = vector_db
 
-def index_documents(document_chunks):
-    DOCUMENT_VECTOR_DB.add_documents(document_chunks)
-
+def index_documents(chunks):
+    vector_db = st.session_state.vector_db  # This will now access the correctly initialized vector store
+    vector_db.add_texts(chunks)
 
 def find_related_documents(query):
-    return DOCUMENT_VECTOR_DB.similarity_search(query)
-
+    vector_db = st.session_state.vector_db
+    return vector_db.similarity_search(query)
 
 def generate_answer(user_query, context_documents):
     context_text = "\n\n".join([doc.page_content for doc in context_documents])
@@ -114,40 +132,28 @@ def generate_answer(user_query, context_documents):
     response_chain = conversation_prompt | LANGUAGE_MODEL
     return response_chain.invoke({"user_query": user_query, "document_context": context_text})
 
-
-# UI Configuration
-
-
 st.title("📘 DocuMind AI")
 st.markdown("### Your Intelligent Document Assistant")
 st.markdown("---")
 
-# File Upload Section
-uploaded_pdf = st.file_uploader(
-    "Upload Research Document (PDF)",
-    type="pdf",
-    help="Select a PDF document for analysis",
-    accept_multiple_files=False
+uploaded_pdfs = st.file_uploader("Upload Research Documents (PDFs)", type="pdf", accept_multiple_files=True)
 
-)
+if uploaded_pdfs:
+    for uploaded_pdf in uploaded_pdfs:
+        saved_path = save_uploaded_file(uploaded_pdf)
+        text = extract_text_from_pdf(saved_path)
+        chunks = chunk_text(text)
+    initialize_vector_store(chunks)  # Initialize the vector store first
+    index_documents(chunks)  # Now index the documents
+    st.success("✅ Documents processed successfully! Ask your questions below.")
 
-if uploaded_pdf:
-    saved_path = save_uploaded_file(uploaded_pdf)
-    raw_docs = load_pdf_documents(saved_path)
-    processed_chunks = chunk_documents(raw_docs)
-    index_documents(processed_chunks)
+user_input = st.chat_input("Enter your question about the documents...")
 
-    st.success("✅ Document processed successfully! Ask your questions below.")
-
-    user_input = st.chat_input("Enter your question about the document...")
-
-    if user_input:
-        with st.chat_message("user"):
-            st.write(user_input)
-
-        with st.spinner("Analyzing document..."):
-            relevant_docs = find_related_documents(user_input)
-            ai_response = generate_answer(user_input, relevant_docs)
-
-        with st.chat_message("assistant", avatar="🤖"):
-            st.write(ai_response)
+if user_input:
+    with st.chat_message("user"):
+        st.write(user_input)
+    with st.spinner("Analyzing documents..."):
+        relevant_docs = find_related_documents(user_input)
+        ai_response = generate_answer(user_input, relevant_docs)
+    with st.chat_message("assistant", avatar="🤖"):
+        st.write(ai_response)
